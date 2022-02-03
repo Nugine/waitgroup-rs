@@ -1,150 +1,110 @@
-//! A WaitGroup waits for a collection of task to finish.
-//!
-//! ## Examples
-//! ```rust
-//! use waitgroup::WaitGroup;
-//! use async_std::task;
-//! # task::block_on(
-//! async {
-//!     let wg = WaitGroup::new();
-//!     for _ in 0..100 {
-//!         // 1. basic usage
-//!         let w = wg.worker();
-//!         task::spawn(async move {
-//!             // do work...
-//!             drop(w); // drop w means task finished, or just use `let _worker = w;`
-//!         });
-//!         // 2. waiting nested tasks using `Worker::clone`.
-//!         let w = wg.worker();
-//!         task::spawn(async move {
-//!             let worker = w;
-//!             // do work...
-//!             let sub_task = worker.clone();
-//!             task::spawn(async move {
-//!                 let _sub_task = sub_task;
-//!                 // do work...
-//!             });
-//!         });
-//!         // 3. waiting blocking tasks
-//!         let blocking_worker = wg.worker();
-//!         std::thread::spawn(move || {
-//!             let _blocking_worker = blocking_worker;
-//!             // do blocking work...
-//!         });
-//!     }
-//!
-//!     wg.wait().await;
-//! }
-//! # );
-//! ```
+#![deny(unsafe_code, clippy::all)]
 
-use atomic_waker::AtomicWaker;
+#[allow(unsafe_code)]
+mod inner;
+
+use self::inner::InnerPtr;
+
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
-pub struct WaitGroup {
-    inner: Arc<Inner>,
-}
+pub struct WaitGroup(InnerPtr);
 
 #[derive(Clone)]
-pub struct Worker(Arc<Inner>);
+pub struct Working(InnerPtr);
 
-pub struct WaitGroupFuture {
-    inner: Weak<Inner>,
-}
-
-impl WaitGroupFuture {
-    /// Gets the number of active workers.
-    pub fn workers(&self) -> usize {
-        Weak::strong_count(&self.inner)
-    }
-}
-
-struct Inner {
-    waker: AtomicWaker,
-}
-
-impl Drop for Inner {
-    fn drop(&mut self) {
-        self.waker.wake();
-    }
-}
+pub struct WaitFuture(InnerPtr);
 
 impl WaitGroup {
+    #[inline]
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                waker: AtomicWaker::new(),
-            }),
-        }
+        Self(InnerPtr::new())
     }
 
-    pub fn worker(&self) -> Worker {
-        Worker(self.inner.clone())
+    #[inline]
+    pub fn working(&self) -> Working {
+        Working(self.0.clone())
     }
 
-    /// Gets the number of active workers.
-    pub fn workers(&self) -> usize {
-        Arc::strong_count(&self.inner) - 1
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.0.count()
     }
 
-    pub fn wait(self) -> WaitGroupFuture {
-        WaitGroupFuture {
-            inner: Arc::downgrade(&self.inner),
-        }
+    #[inline]
+    pub fn wait(self) -> WaitFuture {
+        WaitFuture(self.0)
     }
 }
 
 impl Default for WaitGroup {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-/*
-IntoFuture tracking issue: https://github.com/rust-lang/rust/issues/67644
-impl IntoFuture for WaitGroup {
-    type Output = ();
-    type Future = WaitGroupFuture;
-
-    fn into_future(self) -> Self::Future {
-        WaitGroupFuture { inner: Arc::downgrade(&self.inner) }
+impl Working {
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.0.count()
     }
 }
-*/
 
-impl Future for WaitGroupFuture {
+impl WaitFuture {
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.0.count()
+    }
+}
+
+impl Future for WaitFuture {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner.upgrade() {
-            Some(inner) => {
-                inner.waker.register(cx.waker());
-                Poll::Pending
-            }
-            None => Poll::Ready(()),
+        if self.0.count() == 0 {
+            return Poll::Ready(());
         }
+        self.0.register_waker(cx.waker());
+        if self.0.count() == 0 {
+            return Poll::Ready(());
+        }
+        Poll::Pending
     }
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use async_std::task;
+mod tests {
+    use super::WaitGroup;
 
-    #[async_std::test]
-    async fn smoke() {
+    #[test]
+    fn simple() {
         let wg = WaitGroup::new();
+        let working_vec = vec![wg.working(); 100];
+        assert_eq!(wg.count(), 100);
+        let future = wg.wait();
+        drop(future);
+        drop(working_vec);
+    }
 
-        for _ in 0..100 {
-            let w = wg.worker();
-            task::spawn(async move {
-                drop(w);
+    #[tokio::test]
+    async fn tokio_test() {
+        use tokio::time::{sleep, Duration};
+
+        let wg = WaitGroup::new();
+        assert_eq!(wg.count(), 0);
+
+        let n = 100;
+        for _ in 0..n {
+            let working = wg.working();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                drop(working);
             });
         }
 
+        assert_eq!(wg.count(), 100);
         wg.wait().await;
     }
 }
